@@ -1,0 +1,13 @@
+{
+  "ear_baseline": 0.3245683276331223,
+  "ear_open_p20": 0.30737821366478624,
+  "ear_hard_fraction": 0.6,
+  "ear_soft_fraction": 0.9,
+  "center_h": 0.45822134868613124,
+  "center_v": 0.386786486366717,
+  "h_sensitivity": 0.05,
+  "v_sensitivity": 0.05,
+  "blink_min_ms": 40,
+  "min_inter_blink_ms": 120,
+  "is_calibrated": true
+}

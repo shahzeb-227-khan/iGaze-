@@ -1,0 +1,94 @@
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.env
+
+# pip
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ── Jupyter / IPython ────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Testing & coverage ───────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+nosetests.xml
+coverage.xml
+*.cover
+
+# ── Type checkers & linters ──────────────────────────────────────────────────
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+
+# ── IDE / Editor ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS-generated files ───────────────────────────────────────────────────────
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+.Spotlight-V100
+.Trashes
+
+# ── Computer-vision / ML artefacts ───────────────────────────────────────────
+# Model weights & large binary assets
+*.pt
+*.pth
+*.onnx
+*.h5
+*.pkl
+*.joblib
+*.caffemodel
+*.prototxt
+
+# Captured frames / recordings
+*.mp4
+*.avi
+*.mov
+*.mkv
+captured_frames/
+recordings/
+
+# Calibration data written at runtime
+calibration*.json
+calibration*.pkl
+*.calib
+
+# ── Logs & temporary files ───────────────────────────────────────────────────
+*.log
+logs/
+tmp/
+temp/
+
+# ── Secrets & config overrides ───────────────────────────────────────────────
+.env
+.env.*
+secrets.py
+config_local.py
