@@ -8,6 +8,7 @@ Look CENTER first, then it learns your personal eye ranges.
 import time
 import numpy as np
 import cv2
+from igaze.vision.gaze_model import eye_features
 
 GAZE_CENTER = "CENTER"
 GAZE_LEFT   = "LEFT"
@@ -37,16 +38,20 @@ class GazeDetector:
         self.DOUBLE_BLINK_WINDOW = double_blink_interval
 
         self._frame_counter = 0
+        self._closed_at = None
+        self._last_blink = None
+        self.ear_open_p20 = None
         self._blink_times   = []
         self.total_blinks   = 0
         self.last_gaze      = GAZE_CENTER
 
         # Smoothing
         self._gaze_history = []
-        self._history_size = 5
+        self._history_size = 3
 
         # Calibration
         self.calibrated    = False
+        self.gaze_model    = None
         self.center_h      = 0.5
         self.center_v      = 0.5
         self.h_sensitivity = 0.05
@@ -145,7 +150,11 @@ class GazeDetector:
     # Blink Detection
     # --------------------------------------------------
 
-    def update_blink(self, left_ear, right_ear):
+    @property
+    def eyes_closed(self):
+        return self._closed_at is not None
+
+    def update_blink(self, left_ear, right_ear, sample_time=None):
         avg_ear      = (left_ear + right_ear) / 2.0
         single_blink = False
         double_blink = False
@@ -163,14 +172,25 @@ class GazeDetector:
                 right_wink = True
             self._wink_frames = 0
 
-        # --- Normal blink detection (both eyes) ---
-        if avg_ear < self.EAR_THRESH:
-            self._frame_counter += 1
-        else:
-            if self._frame_counter >= self.BLINK_FRAMES:
+        # Count a brief close/reopen in real time, even if the camera sampled
+        # just one closed frame. A wink or sustained closure is not a blink.
+        now = time.monotonic() if sample_time is None else sample_time
+        closed = self.EAR_THRESH
+        if self.ear_open_p20 is not None:
+            # A very low calibrated trough must not require the webcam to
+            # sample the exact bottom of a fast blink.
+            closed = max(closed, .74 * self.ear_open_p20)
+        reopened = closed + .012
+        if self._closed_at is None:
+            if avg_ear < closed and max(left_ear, right_ear) < reopened:
+                self._closed_at = now
+        elif avg_ear >= reopened:
+            duration = now - self._closed_at
+            self._closed_at = None
+            if .025 <= duration <= .38 and (self._last_blink is None or now - self._last_blink >= .10):
                 single_blink = True
+                self._last_blink = now
                 self.total_blinks += 1
-                now = time.time()
                 self._blink_times.append(now)
                 self._blink_times = [
                     t for t in self._blink_times
@@ -179,7 +199,6 @@ class GazeDetector:
                 if len(self._blink_times) >= 2:
                     double_blink = True
                     self._blink_times.clear()
-            self._frame_counter = 0
 
         return single_blink, double_blink, right_wink
     # --------------------------------------------------
@@ -190,25 +209,36 @@ class GazeDetector:
         self._gaze_history.append(gaze)
         if len(self._gaze_history) > self._history_size:
             self._gaze_history.pop(0)
-        return max(set(self._gaze_history), key=self._gaze_history.count)
+        return max(reversed(self._gaze_history), key=self._gaze_history.count)
 
     def get_gaze_direction(self, frame, landmarks_raw, left_eye=None, right_eye=None):
         if landmarks_raw is None:
-            return self.last_gaze
+            self.reset_gaze()
+            return None
 
         h, w         = frame.shape[:2]
+        if self.gaze_model is not None:
+            gaze = self.gaze_model.predict(eye_features(landmarks_raw, w, h))
+            if gaze is None:
+                self.reset_gaze()
+                return None
+            self.last_gaze = self._smooth_gaze(gaze)
+            return self.last_gaze
+
         avg_h, avg_v = self._get_iris_ratios(landmarks_raw, w, h)
 
-        if avg_h is None:
-            return self.last_gaze
+        if avg_h is None or not np.isfinite(avg_h) or not np.isfinite(avg_v):
+            self.reset_gaze()
+            return None
 
         # How far iris moved from YOUR calibrated center
         diff_h = avg_h - self.center_h
         diff_v = avg_v - self.center_v
 
-        if diff_h < -self.h_sensitivity:
+        horizontal_threshold = self.h_sensitivity * .82
+        if diff_h < -horizontal_threshold:
             gaze = GAZE_LEFT
-        elif diff_h > self.h_sensitivity:
+        elif diff_h > horizontal_threshold:
             gaze = GAZE_RIGHT
         elif diff_v < -self.v_sensitivity:
             gaze = GAZE_UP
@@ -221,10 +251,22 @@ class GazeDetector:
         self.last_gaze = gaze
         return gaze
 
+    def reset_gaze(self):
+        self._gaze_history.clear()
+        self.last_gaze = GAZE_CENTER
+
+    def reset_tracking(self):
+        self.reset_gaze()
+        self._frame_counter = 0
+        self._closed_at = None
+        self._last_blink = None
+        self._wink_frames = 0
+        self._blink_times.clear()
+
 
 # --- Quick Test ---
 if __name__ == "__main__":
-    from eye_tracker import EyeTracker
+    from igaze.vision.eye_tracker import EyeTracker
 
     tracker  = EyeTracker()
     detector = GazeDetector()

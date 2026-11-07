@@ -5,6 +5,8 @@ Captures webcam feed and detects eye landmarks using
 MediaPipe FaceLandmarker (new API) — works on Python 3.12+
 """
 
+import time
+
 import cv2
 import numpy as np
 import mediapipe as mp
@@ -21,14 +23,18 @@ class EyeTracker:
         base_options  = python.BaseOptions(model_asset_path=model_path)
         options       = vision.FaceLandmarkerOptions(
             base_options=base_options,
+            running_mode=vision.RunningMode.VIDEO,
             output_face_blendshapes=False,
             output_facial_transformation_matrixes=False,
             num_faces=1
         )
         self.detector = vision.FaceLandmarker.create_from_options(options)
         self.cap      = cv2.VideoCapture(camera_index)
+        self.capture_time = 0.0
+        self._timestamp_ms = -1
 
         if not self.cap.isOpened():
+            self.release()
             raise RuntimeError("Cannot open webcam.")
 
         print("[EyeTracker] Ready.")
@@ -50,6 +56,7 @@ class EyeTracker:
 
     def get_frame_data(self):
         ret, frame = self.cap.read()
+        self.capture_time = time.monotonic()
         if not ret:
             return None, None, None, None, 0.0, 0.0
 
@@ -59,7 +66,8 @@ class EyeTracker:
         h, w = frame.shape[:2]
         rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        result   = self.detector.detect(mp_image)
+        self._timestamp_ms = max(self._timestamp_ms + 1, int(self.capture_time * 1000))
+        result = self.detector.detect_for_video(mp_image, self._timestamp_ms)
 
         left_eye = right_eye = None
         left_ear = right_ear = 0.0
@@ -109,6 +117,7 @@ class EyeTracker:
 
     def release(self):
         self.cap.release()
+        self.detector.close()
         print("[EyeTracker] Released.")
 
 
@@ -145,23 +154,3 @@ if __name__ == "__main__":
         tracker.release()
         cv2.destroyAllWindows()
         print("Stream closed.")
-
-
-# --- Quick Test ---
-if __name__ == "__main__":
-    tracker = EyeTracker()
-    print("Press 'q' to quit.")
-
-    while True:
-        frame, landmarks, left_eye, right_eye, left_ear, right_ear = tracker.get_frame_data()
-        if frame is None:
-            break
-
-        frame = tracker.draw_debug(frame, landmarks, left_eye, right_eye, left_ear, right_ear)
-        cv2.imshow("iGAZE - Eye Tracker", frame)
-
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-    tracker.release()
-    cv2.destroyAllWindows()

@@ -34,32 +34,36 @@ DESIGN DECISIONS
 
 4. Dead-zone + proportional speed
    Pitch within ±dead_zone degrees is neutral (no scroll). Beyond that,
-   speed scales linearly to max_scroll_px_per_sec, giving natural control.
+   speed scales linearly to max_scroll_steps_per_sec, giving natural control.
    Dead-zone raised to 10° to avoid accidental scroll from minor head nods.
 
-5. Fractional-pixel accumulator
-   Avoids rounding loss at slow speeds; whole-pixel chunks are flushed
-   each frame, giving smooth scroll at any speed.
+5. Capped wheel cadence
+   A deliberate tilt sends one notch, followed by a bounded repeat rate.
 
 6. App-Switcher suspends scrolling
    Head pitch is ignored while Win+Tab is open so head movements while
    reading the app list don't accidentally trigger a scroll.
 """
 
+import math
+import sys
+import threading
 import time
 
 try:
     import pyautogui
-    pyautogui.PAUSE    = 0.0
-    pyautogui.FAILSAFE = False
     _PYAUTOGUI = True
 except ImportError:
     _PYAUTOGUI = False
 
-from gaze_detector import GAZE_LEFT, GAZE_RIGHT, GAZE_CENTER
+from igaze.vision.gaze_detector import GAZE_LEFT, GAZE_RIGHT, GAZE_CENTER, GAZE_UP, GAZE_DOWN
 
 # ── Modes ──────────────────────────────────────────────────────────────────
 MODE_NORMAL = "normal"
+
+
+class DesktopInputStopped(RuntimeError):
+    """The user activated the mouse-corner emergency stop."""
 MODE_APPSW  = "app_sw"   # App-Switcher open, gaze L/R navigates apps
 
 
@@ -77,8 +81,8 @@ class GestureMapper:
         Pitch range (±degrees) treated as neutral — no scroll.
     head_max_pitch : float
         Pitch angle (degrees) that yields maximum scroll speed.
-    max_scroll_px_per_sec : float
-        Peak scroll speed in pixels per second.
+    max_scroll_steps_per_sec : float
+        Peak scroll speed in wheel notches per second.
     triple_blink_window : float
         Rolling window (seconds) in which 3 blinks must occur for a triple.
     disable_hold_sec : float
@@ -92,24 +96,36 @@ class GestureMapper:
 
     def __init__(
         self,
-        gaze_hold_seconds:     float = 0.8,    # reduced from 1.5 s — snappier tab switch
-        action_cooldown:       float = 0.9,    # reduced from 1.5 s — faster repeat actions
+        gaze_hold_seconds:     float = 0.50,
+        action_cooldown:       float = 0.55,
         head_dead_zone:        float = 10.0,   # raised from 5° — prevents micro-nod scroll
         head_max_pitch:        float = 20.0,
-        max_scroll_px_per_sec: float = 300.0,  # halved from 600 — less sensitive
-        triple_blink_window:   float = 0.9,    # tightened from 1.2 s — fewer false triples
+        max_scroll_steps_per_sec: float = 3.0,
+        head_hold_seconds:     float = .22,
+        triple_blink_window:   float = 1.25,
         disable_hold_sec:      float = 5.0,    # 5 s intentional eye-close to toggle control
     ):
         self.gaze_hold        = gaze_hold_seconds
         self.cooldown         = action_cooldown
         self.head_dead_zone   = head_dead_zone
         self.head_max_pitch   = head_max_pitch
-        self.max_scroll       = max_scroll_px_per_sec
+        self.max_scroll       = max_scroll_steps_per_sec
+        self.head_hold_seconds = head_hold_seconds
         self.triple_win       = triple_blink_window
         self.disable_hold_sec = disable_hold_sec
 
         self.enabled          = True
         self.mode             = MODE_NORMAL
+        self.actions_sent = 0
+        self.on_action = None
+        self._input_lock = threading.Lock()
+        self._input_paused = False
+        self._pause_version = 0
+        self._seen_pause_version = 0
+        self._needs_neutral = False
+        self._last_nav_direction = None
+        self._neutral_since = None
+        self._gaze_pause_since = None
 
         # ── Gaze tracking ─────────────────────────────────────────────────
         self._current_gaze    = GAZE_CENTER
@@ -117,13 +133,15 @@ class GestureMapper:
         self._last_action_t   = 0.0
 
         # ── Head / scroll ─────────────────────────────────────────────────
-        self._last_frame_t    = time.time()
-        self._scroll_debt: float = 0.0
+        self._tilt_direction = 0
+        self._scroll_active = False
+        self._next_scroll_at = 0.0
 
         # ── Triple-blink detector ─────────────────────────────────────────
         self._blink_times: list[float] = []   # timestamps of recent blinks
+        self._head_tilted_at = None
         self._mode_change_t: float = 0.0      # time of last mode switch (suppresses ghost blinks)
-        self._BLINK_SUPPRESS_AFTER_MODE: float = 1.5  # seconds to ignore blinks after mode change
+        self._BLINK_SUPPRESS_AFTER_MODE: float = .45
 
         # ── 10-second eye-close ───────────────────────────────────────────
         self._eye_close_start:  float | None = None
@@ -134,68 +152,163 @@ class GestureMapper:
     # Public API  —  call once per frame from your main loop
     # ══════════════════════════════════════════════════════════════════════
 
-    def update_gaze(self, gaze_direction: str):
-        """
-        Feed current gaze direction every frame.
+    def update_frame(self, gaze, pitch, *, eye_open, blink):
+        """Choose one command channel before updating its dwell timer."""
+        if self._pause_version != self._seen_pause_version:
+            self._seen_pause_version = self._pause_version
+            self.reset_tracking()
+            self._needs_neutral = True
+            self._last_nav_direction = None
+            self.mode = MODE_NORMAL
+        if self._input_paused:
+            return "PAUSED", 0
 
-        Normal mode  : LEFT/RIGHT → switch browser tab.
-        App-sw mode  : LEFT/RIGHT → navigate app list via arrow keys.
-        UP/DOWN      : always silently ignored.
-        """
-        if not self.enabled:
+        mode, enabled = self.mode, self.enabled
+        self.update_eye_state(eye_open)
+        if self.mode != mode or self.enabled != enabled:
+            self.reset_tracking()
+            return "idle", 0
+
+        now = time.monotonic()
+        tilted = (self.enabled and pitch is not None
+                  and math.isfinite(pitch) and abs(pitch) > self.head_dead_zone)
+        continuing = (self._scroll_active and pitch is not None and math.isfinite(pitch)
+                      and self._tilt_direction * pitch > .70 * self.head_dead_zone)
+        if tilted or continuing:
+            self._head_tilted_at = now
+            self._blink_times.clear()
+            self._clear_gaze_hold()
+            scroll = self.update_head_pitch(pitch if eye_open else None)
+            if self._scroll_active:
+                self._needs_neutral = True
+            return scroll
+
+        self._reset_scroll()
+        # Suppress a blink completed during the return from a head tilt.
+        settled = self._head_tilted_at is None or now - self._head_tilted_at >= .12
+        self.update_blink(blink and settled)
+        if self.mode != mode:
+            self._clear_gaze_hold()
+            self._needs_neutral = False
+            self._last_nav_direction = None
+            self._last_action_t = now
+            return "idle", 0
+        if not settled or len(self._blink_times) >= 2:
+            self._clear_gaze_hold()
+            return "idle", 0
+
+        before = self.actions_sent
+        self.update_gaze(gaze, eyes_closed=not eye_open)
+        if self.actions_sent != before:
+            self._blink_times.clear()
+        return "idle", 0
+
+    def _clear_gaze_hold(self):
+        self._neutral_since = None
+        self._gaze_pause_since = None
+        self._current_gaze = GAZE_CENTER
+        self._gaze_start = None
+
+    def update_gaze(self, gaze_direction: str | None, *, eyes_closed=False):
+        """Send one navigation command per hold. A blink does not rearm it."""
+        now = time.monotonic()
+        if self.enabled and (eyes_closed or gaze_direction is None):
+            self._neutral_since = None
+            if self._gaze_pause_since is None:
+                self._gaze_pause_since = now
+            elif now - self._gaze_pause_since > .25:
+                self._gaze_start = None
             return
-
-        if gaze_direction not in (GAZE_LEFT, GAZE_RIGHT):
+        if self._gaze_pause_since is not None:
+            gap = now - self._gaze_pause_since
+            if self._gaze_start is not None and gaze_direction == self._current_gaze and gap <= .25:
+                self._gaze_start += gap
+            else:
+                self._gaze_start = None
+            self._gaze_pause_since = None
+        task_view = self.mode == MODE_APPSW
+        if not self.enabled or gaze_direction not in (GAZE_LEFT, GAZE_RIGHT):
             self._current_gaze = GAZE_CENTER
-            self._gaze_start   = None
+            self._gaze_start = None
+            if self.enabled and gaze_direction in (GAZE_CENTER, GAZE_UP, GAZE_DOWN):
+                if self._neutral_since is None:
+                    self._neutral_since = now
+                if now - self._neutral_since >= .15:
+                    self._needs_neutral = False
+            else:
+                self._neutral_since = None
             return
-
-        now = time.time()
-        if gaze_direction == self._current_gaze:
-            if self._gaze_start and (now - self._gaze_start) >= self.gaze_hold:
-                if (now - self._last_action_t) >= self.cooldown:
-                    if self.mode == MODE_APPSW:
-                        self._navigate_app(gaze_direction)
-                    else:
-                        self._switch_tab(gaze_direction)
-                    self._last_action_t = now
-                    self._gaze_start    = now   # restart for repeat actions
-        else:
+        self._neutral_since = None
+        if self._needs_neutral and (not task_view or gaze_direction == self._last_nav_direction):
+            return
+        if gaze_direction != self._current_gaze or self._gaze_start is None:
             self._current_gaze = gaze_direction
-            self._gaze_start   = now
-
-    def update_head_pitch(self, pitch: float | None):
-        """
-        Feed the smoothed head pitch (degrees) every frame.
-        Positive = head tilted DOWN; negative = head tilted UP.
-        No-op while App-Switcher is open.
-        """
-        now = time.time()
-        dt  = now - self._last_frame_t
-        self._last_frame_t = now
-
-        if not self.enabled or self.mode == MODE_APPSW or pitch is None:
-            self._scroll_debt = 0.0
+            self._gaze_start = now
             return
-
-        abs_p = abs(pitch)
-        if abs_p <= self.head_dead_zone:
-            self._scroll_debt = 0.0
+        hold = min(self.gaze_hold, .32) if task_view else self.gaze_hold
+        cooldown = min(self.cooldown, .34) if task_view else self.cooldown
+        if now - self._gaze_start < hold or now - self._last_action_t < cooldown:
             return
+        if self.mode == MODE_APPSW:
+            self._navigate_app(gaze_direction)
+        else:
+            self._switch_tab(gaze_direction)
+        self._last_action_t = now
+        self._gaze_start = None
+        self._needs_neutral = True
+        self._last_nav_direction = gaze_direction
 
-        effective = abs_p - self.head_dead_zone
-        max_eff   = max(self.head_max_pitch - self.head_dead_zone, 1e-6)
-        speed_f   = min(effective / max_eff, 1.0)
-        px        = speed_f * self.max_scroll * dt
+    def update_head_pitch(self, pitch: float | None) -> tuple[str, int]:
+        """Send one wheel notch after a deliberate tilt, then repeat at a capped rate."""
+        if not self.enabled or self.mode == MODE_APPSW or pitch is None or not math.isfinite(pitch):
+            self._reset_scroll()
+            return "idle", 0
 
-        # head UP (pitch < 0) → positive scroll (up); head DOWN → negative
-        self._scroll_debt += px if pitch < 0 else -px
+        now = time.monotonic()
+        direction = 1 if pitch > 0 else -1
+        continuing = self._scroll_active and direction == self._tilt_direction
+        # A smaller release zone avoids flickering around the entry threshold.
+        dead_zone = self.head_dead_zone * .70 if continuing else self.head_dead_zone
+        if abs(pitch) <= dead_zone:
+            self._reset_scroll()
+            return "idle", 0
 
-        if abs(self._scroll_debt) >= 1.0:
-            chunk = int(self._scroll_debt)
-            self._scroll_debt -= chunk
+        if direction != self._tilt_direction:
+            self._tilt_direction = direction
+            self._scroll_active = False
+            self._next_scroll_at = now + self.head_hold_seconds
+
+        pitch_range = max(1, self.head_max_pitch - self.head_dead_zone)
+        strength = min(1, max(0, (abs(pitch) - self.head_dead_zone) / pitch_range))
+        rate = self.max_scroll * (.60 + .40 * strength)
+        if now >= self._next_scroll_at:
+            # PyAutoGUI's Windows backend forwards raw wheel delta. One
+            # physical wheel notch is 120 on Windows, and one click elsewhere.
+            wheel_notch = 120 if sys.platform == "win32" else 1
             if _PYAUTOGUI:
-                pyautogui.scroll(chunk)
+                self._send("scroll_down" if direction > 0 else "scroll_up",
+                           pyautogui.scroll, -direction * wheel_notch)
+            self._scroll_active = True
+            self._next_scroll_at = now + 1 / rate
+
+        if not self._scroll_active:
+            return "HOLD", 0
+        return ("DOWN" if direction > 0 else "UP"), round(100 * rate / self.max_scroll)
+
+    def _reset_scroll(self):
+        self._tilt_direction = 0
+        self._scroll_active = False
+        self._next_scroll_at = 0.0
+
+    def reset_tracking(self, *, keep_completed_blinks=False):
+        self._clear_gaze_hold()
+        self._reset_scroll()
+        self._head_tilted_at = None
+        if not keep_completed_blinks:
+            self._blink_times.clear()
+        self._eye_close_start = None
+        self._eye_closed_frames = 0
+        self._disable_fired = False
 
     def update_blink(self, blink_occurred: bool):
         """
@@ -204,13 +317,12 @@ class GestureMapper:
         Internally accumulates timestamps. When 3 blinks fall within
         triple_blink_window seconds, the triple-blink action fires.
         """
-        if not self.enabled or not blink_occurred:
-            return
-
-        now = time.time()
+        now = time.monotonic()
         # Drop blinks outside the rolling window
         self._blink_times = [t for t in self._blink_times
                              if now - t <= self.triple_win]
+        if not self.enabled or not blink_occurred or now - self._mode_change_t < self._BLINK_SUPPRESS_AFTER_MODE:
+            return
         self._blink_times.append(now)
 
         if len(self._blink_times) >= 3:
@@ -228,7 +340,7 @@ class GestureMapper:
         brief EAR dip caused by tilting the head upward from being treated as
         a real eye closure.
         """
-        now = time.time()
+        now = time.monotonic()
 
         if not eye_open:
             # Increment debounce counter; only start the timer once we've seen
@@ -254,56 +366,91 @@ class GestureMapper:
 
     # Re-enable from outside (e.g. a GUI button or keyboard shortcut)
     def enable(self):
+        self.set_input_paused(False)
+        self._seen_pause_version = self._pause_version
+        self._needs_neutral = False
+        self.reset_tracking()
         self.enabled      = True
-        self._scroll_debt = 0.0
+        self._reset_scroll()
 
     # ══════════════════════════════════════════════════════════════════════
     # Internal helpers
     # ══════════════════════════════════════════════════════════════════════
+
+    @property
+    def input_paused(self):
+        return self._input_paused
+
+    @property
+    def input_epoch(self):
+        return self._pause_version
+
+    def set_input_paused(self, paused):
+        with self._input_lock:
+            if self._input_paused != paused:
+                self._input_paused = paused
+                self._pause_version += 1
+
+    def _send(self, kind, action, *args):
+        with self._input_lock:
+            if self._input_paused or self._pause_version != self._seen_pause_version:
+                return False
+            try:
+                action(*args, _pause=False)
+            except pyautogui.FailSafeException as exc:
+                raise DesktopInputStopped(
+                    "Mouse-corner emergency stop. Move the pointer away from the corner, "
+                    "then click Start Tracking when ready."
+                ) from exc
+            self.actions_sent += 1
+            if self.on_action is not None:
+                self.on_action(kind, self.mode)
+            return True
 
     def _handle_triple_blink(self):
         if not _PYAUTOGUI:
             return
         # Suppress triple-blink if we just changed mode (prevents head-scroll
         # movements from accumulating ghost blinks during the transition).
-        if time.time() - self._mode_change_t < self._BLINK_SUPPRESS_AFTER_MODE:
+        if time.monotonic() - self._mode_change_t < self._BLINK_SUPPRESS_AFTER_MODE:
             return
         if self.mode == MODE_NORMAL:
-            pyautogui.hotkey('win', 'tab')   # open Task View / App Switcher
+            if not self._send("open_task_view", pyautogui.hotkey, 'win', 'tab'):
+                return
             self.mode          = MODE_APPSW
             self._current_gaze = GAZE_CENTER
             self._gaze_start   = None
-            self._scroll_debt  = 0.0
+            self._reset_scroll()
             self._blink_times.clear()        # discard any blinks from before switch
-            self._mode_change_t = time.time()
+            self._mode_change_t = time.monotonic()
         elif self.mode == MODE_APPSW:
-            pyautogui.press('enter')         # confirm selected app
+            if not self._send("confirm_app", pyautogui.press, 'enter'):
+                return
             self.mode          = MODE_NORMAL
             self._current_gaze = GAZE_CENTER
             self._gaze_start   = None
             self._blink_times.clear()        # discard blinks accumulated in switcher
-            self._mode_change_t = time.time()
+            self._mode_change_t = time.monotonic()
 
     def _switch_tab(self, gaze: str):
         if not _PYAUTOGUI:
             return
         if gaze == GAZE_LEFT:
-            pyautogui.hotkey('ctrl', 'shift', 'tab')
+            self._send("previous_tab", pyautogui.hotkey, 'ctrl', 'shift', 'tab')
         elif gaze == GAZE_RIGHT:
-            pyautogui.hotkey('ctrl', 'tab')
+            self._send("next_tab", pyautogui.hotkey, 'ctrl', 'tab')
 
     def _navigate_app(self, gaze: str):
-        if not _PYAUTOGUI:
-            return
-        pyautogui.press('left' if gaze == GAZE_LEFT else 'right')
+        if _PYAUTOGUI and gaze in (GAZE_LEFT, GAZE_RIGHT):
+            self._send("app_" + gaze.lower(), pyautogui.press, gaze.lower())
 
     def _disable_control(self):
         """Toggle eye control on/off."""
         if self.mode == MODE_APPSW and _PYAUTOGUI:
-            pyautogui.press('escape')
+            self._send("cancel_task_view", pyautogui.press, 'escape')
             self.mode = MODE_NORMAL
         self.enabled      = not self.enabled  # Toggle instead of just disabling
-        self._scroll_debt = 0.0
+        self._reset_scroll()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -311,9 +458,9 @@ class GestureMapper:
 # ══════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     import cv2
-    from eye_tracker   import EyeTracker
-    from gaze_detector import GazeDetector
-    from head_pose     import HeadPoseEstimator
+    from igaze.vision.eye_tracker   import EyeTracker
+    from igaze.vision.gaze_detector import GazeDetector
+    from igaze.vision.head_pose     import HeadPoseEstimator
 
     print("\n" + "=" * 60)
     print("         iGAZE v3  —  4-Gesture Control")
@@ -336,7 +483,7 @@ if __name__ == "__main__":
         action_cooldown       = 0.9,    # faster repeat
         head_dead_zone        = 10.0,   # raised: ignore small head nods
         head_max_pitch        = 20.0,
-        max_scroll_px_per_sec = 300.0,  # halved: less accidental scroll
+        max_scroll_steps_per_sec = 3.0,
         triple_blink_window   = 0.9,    # tightened: fewer false Win+Tab
         disable_hold_sec      = 5.0,    # 5 s intentional hold to disable
     )
@@ -393,7 +540,7 @@ if __name__ == "__main__":
             # 10-second progress bar
             if mapper._eye_close_start is not None:
                 prog = min(
-                    (time.time() - mapper._eye_close_start) / mapper.disable_hold_sec,
+                    (time.monotonic() - mapper._eye_close_start) / mapper.disable_hold_sec,
                     1.0)
                 bar_w = int(300 * prog)
                 cv2.rectangle(frame, (10, 232), (310, 250), (40, 40, 40), -1)

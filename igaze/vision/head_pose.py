@@ -75,6 +75,9 @@ class HeadPoseEstimator:
         if self._K is None:
             self._K, self._dist = _build_camera_matrix(w, h)
 
+    def reset(self):
+        self._smooth_pitch = None
+
     def update(self, frame: np.ndarray, face_landmarks) -> float | None:
         """
         Compute and return the smoothed pitch angle (degrees).
@@ -110,14 +113,16 @@ class HeadPoseEstimator:
 
         R, _ = cv2.Rodrigues(rvec)
         pitch, _, _ = _rotation_matrix_to_euler(R)
+        if not math.isfinite(pitch):
+            return None
 
         # Exponential moving average
         if self._smooth_pitch is None:
             self._smooth_pitch = pitch
         else:
-            self._smooth_pitch = self._alpha * pitch + (1 - self._alpha) * self._smooth_pitch
+            # Follow the shortest rotation across the ±180° boundary.
+            delta = (pitch - self._smooth_pitch + 180) % 360 - 180
+            self._smooth_pitch += self._alpha * delta
 
         return self._smooth_pitch
 
-    def reset(self):
-        self._smooth_pitch = None
