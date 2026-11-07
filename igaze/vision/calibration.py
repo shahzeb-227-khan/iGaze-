@@ -19,10 +19,11 @@ Usage
 """
 
 import json
-import os
+import math
 import time
 import numpy as np
 import cv2
+from igaze.vision.gaze_model import GazeModel, LABELS, eye_features
 
 
 class Calibration:
@@ -52,6 +53,7 @@ class Calibration:
         self.min_inter_blink_ms: int   = 120
 
         self.is_calibrated:      bool  = False
+        self.gaze_model = None
 
     # ══════════════════════════════════════════════════════════════════════
     # Calibration procedure
@@ -79,10 +81,10 @@ class Calibration:
         samples_h:   list[float] = []
         samples_v:   list[float] = []
 
-        t0 = time.time()
+        t0 = time.monotonic()
         print("[Phase 1/2] Keep eyes OPEN and look at the green dot…")
 
-        while time.time() - t0 < half:
+        while time.monotonic() - t0 < half:
             frame, landmarks, _, _, left_ear, right_ear = tracker.get_frame_data()
             if frame is None or landmarks is None:
                 continue
@@ -97,7 +99,7 @@ class Calibration:
                 samples_v.append(avg_v)
 
             self._draw_phase(frame, "LOOK AT THE DOT  (eyes OPEN)",
-                             (time.time() - t0) / half, (0, 255, 0))
+                             (time.monotonic() - t0) / half, (0, 255, 0))
             cv2.imshow("iGAZE – Calibration", frame)
             cv2.waitKey(1)
 
@@ -106,14 +108,14 @@ class Calibration:
         in_blink              = False
         blink_low             = 1.0
         prev_ear              = 0.3
-        phase2_start          = time.time()
+        phase2_start          = time.monotonic()
 
         print("[Phase 2/2] Blink naturally 2-3 times when ready…")
         soft_threshold        = np.percentile(samples_ear, 20) if samples_ear else 0.18
 
-        while time.time() - phase2_start < half:
+        while time.monotonic() - phase2_start < half:
             frame, landmarks, _, _, left_ear, right_ear = tracker.get_frame_data()
-            if frame is None:
+            if frame is None or landmarks is None:
                 continue
 
             avg_ear = (left_ear + right_ear) / 2.0
@@ -127,7 +129,7 @@ class Calibration:
                 blink_troughs.append(blink_low)
                 in_blink = False
 
-            elapsed_p2 = time.time() - phase2_start
+            elapsed_p2 = time.monotonic() - phase2_start
             self._draw_phase(frame, "BLINK naturally 2-3 times",
                              elapsed_p2 / half, (255, 255, 0))
             blink_label = f"Blinks detected: {len(blink_troughs)}"
@@ -174,86 +176,125 @@ class Calibration:
     # Apply to running detector
     # ══════════════════════════════════════════════════════════════════════
 
+    def train_gaze_model(self, tracker):
+        """Collect two separate passes with screen-coordinate direction labels."""
+        training = {label: [] for label in LABELS}
+        validation = {label: [] for label in LABELS}
+        window = "iGAZE - Learn left and right"
+        order = (*LABELS, "CENTER", "RIGHT", "LEFT")
+        try:
+            for step, label in enumerate(order):
+                group = training if step < len(LABELS) else validation
+                canvas = np.full((320, 640, 3), 27, dtype=np.uint8)
+                x = {"LEFT": 100, "CENTER": 320, "RIGHT": 540}[label]
+                phase = "Learn" if group is training else "Check"
+                cv2.putText(canvas, f"{phase} {label.lower()} ({step + 1}/6)", (24, 38),
+                            cv2.FONT_HERSHEY_SIMPLEX, .8, (255, 255, 255), 2)
+                cv2.putText(canvas, "Follow the dot with your eyes. Keep your head still.",
+                            (24, 76), cv2.FONT_HERSHEY_SIMPLEX, .53, (220, 220, 220), 1)
+                cv2.circle(canvas, (x, 160), 14, (100, 245, 125), -1)
+                cv2.imshow(window, canvas)
+                start = time.monotonic()
+                while True:
+                    if cv2.waitKey(1) & 0xFF in (27, ord("q")):
+                        raise ValueError("Calibration cancelled.")
+                    frame, landmarks, _, _, left_ear, right_ear = tracker.get_frame_data()
+                    elapsed = time.monotonic() - start
+                    if elapsed >= 1.8:
+                        break
+                    if (elapsed >= .45 and frame is not None
+                            and (left_ear + right_ear) / 2 >= .75 * self.ear_open_p20):
+                        height, width = frame.shape[:2]
+                        features = eye_features(landmarks, width, height)
+                        if features is not None:
+                            group[label].append(features)
+                    preview = canvas.copy()
+                    cv2.rectangle(preview, (24, 266), (616, 278), (75, 75, 75), -1)
+                    cv2.rectangle(preview, (24, 266), (24 + int(592 * elapsed / 1.8), 278),
+                                  (100, 245, 125), -1)
+                    cv2.imshow(window, preview)
+            self.gaze_model = GazeModel.fit(training, validation)
+        finally:
+            try:
+                cv2.destroyWindow(window)
+            except cv2.error:
+                pass
+
     def apply_to_detector(self, detector) -> None:
         """Push calibrated parameters into a GazeDetector instance."""
         detector.ear_baseline      = self.ear_baseline
+        detector.ear_open_p20      = self.ear_open_p20
         detector._ear_hard_thresh  = self.ear_baseline * self.ear_hard_fraction
         detector._ear_soft_thresh  = self.ear_baseline * self.ear_soft_fraction
         detector.EAR_THRESH        = detector._ear_hard_thresh
         detector.center_h          = self.center_h
         detector.center_v          = self.center_v
+        detector.h_sensitivity     = self.h_sensitivity
+        detector.v_sensitivity     = self.v_sensitivity
         detector.calibrated        = self.is_calibrated
+        detector.gaze_model        = self.gaze_model
+        detector.reset_tracking()
         # Refresh debug snapshot
-        detector._debug["ear_baseline"]    = detector.ear_baseline
-        detector._debug["ear_hard_thresh"] = detector._ear_hard_thresh
-        detector._debug["ear_soft_thresh"] = detector._ear_soft_thresh
+        if hasattr(detector, "_debug"):
+            detector._debug["ear_baseline"]    = detector.ear_baseline
+            detector._debug["ear_hard_thresh"] = detector._ear_hard_thresh
+            detector._debug["ear_soft_thresh"] = detector._ear_soft_thresh
         print("[Calibration] Parameters applied to GazeDetector.")
 
     # ══════════════════════════════════════════════════════════════════════
     # Persistence
     # ══════════════════════════════════════════════════════════════════════
 
-    def save_calibration(self, filepath: str) -> bool:
-        """
-        Serialise calibration data to JSON.
+    def to_dict(self):
+        fields = ("ear_baseline", "ear_open_p20", "ear_hard_fraction", "ear_soft_fraction",
+                  "center_h", "center_v", "h_sensitivity", "v_sensitivity", "blink_min_ms",
+                  "min_inter_blink_ms", "is_calibrated")
+        data = {field: getattr(self, field) for field in fields}
+        data["gaze_model"] = self.gaze_model.to_dict() if self.gaze_model else None
+        return data
 
-        Returns True on success.
-        """
-        data = {
-            "ear_baseline":       self.ear_baseline,
-            "ear_open_p20":       self.ear_open_p20,
-            "ear_hard_fraction":  self.ear_hard_fraction,
-            "ear_soft_fraction":  self.ear_soft_fraction,
-            "center_h":           self.center_h,
-            "center_v":           self.center_v,
-            "h_sensitivity":      self.h_sensitivity,
-            "v_sensitivity":      self.v_sensitivity,
-            "blink_min_ms":       self.blink_min_ms,
-            "min_inter_blink_ms": self.min_inter_blink_ms,
-            "is_calibrated":      self.is_calibrated,
-        }
+    @classmethod
+    def from_dict(cls, data):
+        if not isinstance(data, dict) or data.get("is_calibrated") is not True:
+            raise ValueError("No completed calibration.")
+        required = ("ear_baseline", "ear_hard_fraction", "center_h", "center_v")
+        if any(field not in data for field in required):
+            raise ValueError("Saved calibration is incomplete.")
+        result = cls()
+        for field, default in result.to_dict().items():
+            if field in ("is_calibrated", "gaze_model"):
+                continue
+            value = float(data.get(field, default))
+            if not math.isfinite(value):
+                raise ValueError(f"Invalid calibration value for {field}.")
+            setattr(result, field, int(value) if isinstance(default, int) else value)
+        if not (0 < result.ear_baseline <= 1 and 0 < result.ear_hard_fraction < 1
+                and 0 < result.ear_soft_fraction <= 1 and 0 <= result.center_h <= 1
+                and 0 <= result.center_v <= 1 and 0 < result.h_sensitivity <= 1
+                and 0 < result.v_sensitivity <= 1):
+            raise ValueError("Saved calibration is out of range.")
+        result.is_calibrated = True
+        if data.get("gaze_model") is not None:
+            result.gaze_model = GazeModel.from_dict(data["gaze_model"])
+        return result
+
+    def save_calibration(self, filepath: str) -> bool:
         try:
-            with open(filepath, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-            print(f"[Calibration] Saved to {filepath}")
+            with open(filepath, "w", encoding="utf-8") as file:
+                json.dump(self.to_dict(), file, indent=2)
             return True
-        except OSError as exc:
-            print(f"[Calibration] Save failed: {exc}")
+        except OSError:
             return False
 
     def load_calibration(self, filepath: str) -> bool:
-        """
-        Load previously saved calibration from JSON.
-
-        Returns True if the file exists and is valid, False otherwise.
-        """
-        if not os.path.isfile(filepath):
-            return False
+        """Import a calibration written by the earlier JSON-based app."""
         try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                data = json.load(f)
-
-            self.ear_baseline       = float(data["ear_baseline"])
-            self.ear_open_p20       = float(data.get("ear_open_p20", 0.24))
-            self.ear_hard_fraction  = float(data["ear_hard_fraction"])
-            self.ear_soft_fraction  = float(data["ear_soft_fraction"])
-            self.center_h           = float(data["center_h"])
-            self.center_v           = float(data["center_v"])
-            self.h_sensitivity      = float(data.get("h_sensitivity", 0.05))
-            self.v_sensitivity      = float(data.get("v_sensitivity", 0.05))
-            self.blink_min_ms       = int(data.get("blink_min_ms", 40))
-            self.min_inter_blink_ms = int(data.get("min_inter_blink_ms", 120))
-            self.is_calibrated      = bool(data.get("is_calibrated", False))
-
-            print(
-                f"[Calibration] Loaded from {filepath}  "
-                f"(EAR={self.ear_baseline:.3f}  calibrated={self.is_calibrated})"
-            )
-            return self.is_calibrated
-
-        except (KeyError, ValueError, json.JSONDecodeError) as exc:
-            print(f"[Calibration] Load failed ({exc}) — will recalibrate.")
+            with open(filepath, encoding="utf-8-sig") as file:
+                result = self.from_dict(json.load(file))
+        except (OSError, ValueError, TypeError, OverflowError):
             return False
+        self.__dict__.update(result.__dict__)
+        return True
 
     def validate_calibration(self, test_ears: list[float]) -> dict:
         """

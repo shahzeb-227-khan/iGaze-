@@ -13,6 +13,7 @@ Layout
   Section 3 — Sensitivity     (sliders + Apply button)
 """
 
+import sqlite3
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -41,11 +42,14 @@ class iGazeGUI:
 
     def __init__(self, app):
         self.app = app
+        self._calibrating = False
+        self._last_error = ""
 
         self.root = tk.Tk()
         self.root.title("iGAZE v3 — Eye Interaction System")
-        self.root.geometry("520x720")
-        self.root.resizable(False, False)
+        height = min(850, self.root.winfo_screenheight() - 80)
+        self.root.geometry(f"520x{height}")
+        self.root.resizable(True, True)
         self.root.configure(bg=BG)
 
         self._apply_theme()
@@ -162,7 +166,15 @@ class iGazeGUI:
                                    command=self._save_cal_clicked)
         self.btn_save.pack(side="left", expand=True, fill="x", padx=(3, 0))
 
-        # ── Section 2: Live Status ────────────────────────────────────────
+        btn_row3 = ttk.Frame(ctrl_frame)
+        btn_row3.pack(fill="x", pady=(6, 0))
+        self.btn_calibrate_head = ttk.Button(btn_row3, text="CALIBRATE HEAD SCROLL",
+                                             command=lambda: self._calibrate_clicked(kind="head"))
+        self.btn_calibrate_head.pack(side="left", fill="x", expand=True, padx=(0, 3))
+        self.btn_pause = ttk.Button(btn_row3, text="PAUSE INPUT", command=self._toggle_pause,
+                                    state="disabled")
+        self.btn_pause.pack(side="left", fill="x", expand=True, padx=(3, 0))
+
         stat_frame = ttk.LabelFrame(self.root, text=" ● LIVE STATUS ",
                                     padding=10)
         stat_frame.pack(fill="x", padx=12, pady=6)
@@ -215,14 +227,16 @@ class iGazeGUI:
             ("Gaze Hold Time",      "gaze_hold_seconds",   0.5,   3.0, 0.1,
               1.5,  lambda v: f"{v:.1f}s"),
             ("Triple Blink Window", "triple_max_window_ms", 400, 2000,  50,
-             900.0, lambda v: f"{int(v)}ms"),
+             1250.0, lambda v: f"{int(v)}ms"),
             ("Disable Hold",        "disable_hold_sec",    2.0,  15.0, 0.5,
               5.0,  lambda v: f"{v:.1f}s"),
         ]
         self._sliders     = {}
         self._slider_lbls = {}
 
+        saved_settings = self.app.sensitivity()
         for (name, key, lo, hi, res, default, fmt) in self._slider_defs:
+            default = saved_settings.get(key, default)
             row = ttk.Frame(sens_frame)
             row.pack(fill="x", pady=3)
 
@@ -266,76 +280,94 @@ class iGazeGUI:
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
         self.btn_calibrate.config(state="disabled")
+        self.btn_calibrate_head.config(state="disabled")
 
     def _stop_clicked(self):
         self.app.stop_tracking()
-        self.btn_start.config(state="normal")
         self.btn_stop.config(state="disabled")
-        self.btn_calibrate.config(state="normal")
 
-    def _calibrate_clicked(self):
+    def _toggle_pause(self):
+        self.app.set_input_paused(not self.app.state["paused"])
+
+    def _calibrate_clicked(self, *, kind="eye"):
         """Run calibration in a background thread so GUI stays responsive."""
-        self.btn_calibrate.config(state="disabled", text="◎ Calibrating…")
+        if self._calibrating or self.app.state["running"]:
+            return
+        self._calibrating = True
+        active_button = self.btn_calibrate_head if kind == "head" else self.btn_calibrate
+        active_button.config(state="disabled", text="Calibrating…")
         self.btn_start.config(state="disabled")
 
         def _run():
-            self.app.run_calibration()
-            # GUI updates must happen on the main thread
-            self.root.after(0, self._calibration_finished)
+            completed = True
+            try:
+                if kind == "head":
+                    completed = self.app.run_head_calibration()
+                else:
+                    self.app.run_calibration()
+            except Exception as exc:
+                self.root.after(0, self._calibration_finished, str(exc), kind)
+            else:
+                self.root.after(0, self._calibration_finished, None, kind, completed)
 
         threading.Thread(target=_run, daemon=True,
                          name="iGAZE-calibration").start()
 
-    def _calibration_finished(self):
+    def _calibration_finished(self, error=None, kind="eye", completed=True):
+        self._calibrating = False
         self.btn_calibrate.config(state="normal", text="◎ RUN CALIBRATION")
+        self.btn_calibrate_head.config(state="normal", text="CALIBRATE HEAD SCROLL")
         self.btn_start.config(state="normal")
+        if error:
+            messagebox.showerror("iGAZE — Calibration", error)
+            return
+        if not completed:
+            return
+        if kind == "head":
+            messagebox.showinfo("iGAZE — Head scroll", "Neutral, up and down positions saved. "
+                                "Start Tracking and face forward briefly before scrolling.")
+            return
         messagebox.showinfo(
             "iGAZE — Calibration",
-            "Calibration complete!\n\n"
+            "Calibration complete. Left, centre and right model checked and saved.\n\n"
             f"EAR threshold : {self.app.detector.EAR_THRESH:.3f}\n"
             f"Gaze centre H : {self.app.detector.center_h:.3f}\n"
             f"Gaze centre V : {self.app.detector.center_v:.3f}"
         )
 
     def _save_cal_clicked(self):
-        ok = self.app.cal.save_calibration("igaze_cal.json")
-        if ok:
-            messagebox.showinfo("iGAZE", "Calibration saved to igaze_cal.json")
+        try:
+            self.app.save_calibration()
+        except (sqlite3.Error, OSError, ValueError) as exc:
+            messagebox.showerror("iGAZE", str(exc))
         else:
-            messagebox.showerror("iGAZE", "Failed to save calibration.")
+            messagebox.showinfo("iGAZE", "Calibration saved on this device.")
 
     def _load_cal_clicked(self):
-        ok = self.app.cal.load_calibration("igaze_cal.json")
-        if ok:
-            # Apply to live detector
-            try:
-                self.app.cal.apply_to_detector(self.app.detector)
-            except AttributeError:
-                thresh = (self.app.cal.ear_baseline *
-                          self.app.cal.ear_hard_fraction)
-                self.app.detector.EAR_THRESH = thresh
-                self.app.detector.center_h   = self.app.cal.center_h
-                self.app.detector.center_v   = self.app.cal.center_v
-                self.app.detector.calibrated = self.app.cal.is_calibrated
-            self.app.state["calibrated"] = True
+        try:
+            loaded = self.app.load_calibration()
+        except (sqlite3.Error, OSError) as exc:
+            messagebox.showerror("iGAZE", str(exc))
+            return
+        if loaded:
             messagebox.showinfo("iGAZE", "Calibration loaded and applied.")
         else:
-            messagebox.showwarning(
-                "iGAZE",
-                "No valid calibration file found (igaze_cal.json).\n"
-                "Run calibration first."
-            )
+            messagebox.showwarning("iGAZE", "No valid saved calibration. Run calibration first.")
 
     def _apply_settings(self):
         settings = {key: var.get() for key, var in self._sliders.items()}
-        self.app.apply_sensitivity(settings)
-        messagebox.showinfo("iGAZE", "Settings applied.")
+        try:
+            self.app.apply_sensitivity(settings)
+        except (sqlite3.Error, OSError) as exc:
+            messagebox.showerror("iGAZE", str(exc))
+        else:
+            messagebox.showinfo("iGAZE", "Settings applied and saved.")
 
     def _reset_defaults(self):
         defaults = {
             "scroll_dead_zone":    10.0,
-            "gaze_hold_seconds":    1.5,
-            "triple_max_window_ms": 900.0,
+            "gaze_hold_seconds":    0.50,
+            "triple_max_window_ms": 1250.0,
             "disable_hold_sec":     5.0,
         }
         for key, val in defaults.items():
@@ -343,7 +375,7 @@ class iGazeGUI:
         # Trigger the formatter for each slider label
         for (name, key, lo, hi, res, default, fmt) in self._slider_defs:
             self._slider_lbls[key].config(text=fmt(self._sliders[key].get()))
-        self.app.apply_sensitivity(defaults)
+        self._apply_settings()
 
     # ══════════════════════════════════════════════════════════════════════
     # Polling loop  (runs on main thread via root.after)
@@ -354,14 +386,31 @@ class iGazeGUI:
 
         # Status / enabled
         running = s["running"]
+        busy = running or self._calibrating
+        for button in (self.btn_start, self.btn_calibrate, self.btn_calibrate_head,
+                       self.btn_load, self.btn_save):
+            button.config(state="disabled" if busy else "normal")
+        self.btn_stop.config(state="normal" if running else "disabled")
+        paused = s["paused"]
+        self.btn_pause.config(state="normal" if running and not s["emergency_stop"] else "disabled",
+                              text="RESUME INPUT" if paused else "PAUSE INPUT")
         self.lbl_status.config(
             text="● RUNNING" if running else "○ STOPPED",
             fg=GREEN if running else RED)
 
         enabled = s["enabled"]
         self.lbl_control.config(
-            text="ON" if enabled else "OFF",
-            fg=GREEN if enabled else RED)
+            text="PAUSED" if paused else "ON" if enabled else "OFF",
+            fg=YELLOW if paused else GREEN if enabled else RED)
+        error = s["error"]
+        if not running and error and error != self._last_error:
+            self._last_error = error
+            if s["emergency_stop"]:
+                messagebox.showinfo("iGAZE — Emergency stop", error)
+            else:
+                messagebox.showerror("iGAZE — Tracking stopped", error)
+        elif not error:
+            self._last_error = ""
 
         # Mode
         mode = s["mode"]
@@ -435,6 +484,9 @@ class iGazeGUI:
 
     def _on_close(self):
         """Gracefully stop tracking and release camera before destroying."""
+        if self._calibrating:
+            messagebox.showinfo("iGAZE", "Wait for calibration to finish before closing.")
+            return
         if self.app.state["running"]:
             self.app.stop_tracking()
         self.app.cleanup()

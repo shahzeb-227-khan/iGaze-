@@ -56,7 +56,7 @@ Users who experience repetitive strain injury (RSI), manual input fatigue, or li
 ### Advanced Features
 
 - **Two-phase interactive calibration** — Phase 1 collects open-eye EAR baseline and iris centre; Phase 2 measures natural blink troughs to derive user-specific blink thresholds.
-- **Persistent calibration** — Parameters are saved to `igaze_cal.json` and loaded automatically on subsequent launches; recalibration is skipped when a valid file exists.
+- **Persistent calibration** — SQLite stores calibration and sensitivity settings and restores them at launch. Load Cal can import earlier JSON calibration.
 - **Calibration validation** — Post-calibration method reports false-positive rate and mean EAR clearance above the blink threshold.
 - **Gaze smoothing** — A majority-vote history buffer (5-frame window) suppresses transient iris jitter before a gaze direction is reported.
 - **Head pitch EMA smoothing** — Exponential moving average (α = 0.15) on the raw PnP pitch output removes high-frequency jitter without introducing perceptible lag.
@@ -145,12 +145,12 @@ No external web frameworks, databases, or cloud services are used.
 
 | Module | Responsibility |
 |---|---|
-| `eye_tracker.py` | Webcam capture, MediaPipe FaceLandmarker inference, EAR computation, debug visualisation |
-| `gaze_detector.py` | Iris-ratio gaze direction (5-class), blink detection, right-wink detection, gaze smoothing |
-| `head_pose.py` | 6-point PnP head pose estimation, pitch extraction, EMA smoothing |
-| `gesture_mapper.py` | Combines all signals into desktop actions via PyAutoGUI; manages modes, cooldowns, debounce |
-| `calibration.py` | Two-phase interactive calibration, JSON persistence, post-calibration validation |
-| `gui.py` | Tkinter control panel, live status polling, sensitivity slider interface |
+| `igaze/vision/eye_tracker.py` | Webcam capture, MediaPipe FaceLandmarker inference, EAR computation, debug visualisation |
+| `igaze/vision/gaze_detector.py` | Iris-ratio gaze direction (5-class), blink detection, right-wink detection, gaze smoothing |
+| `igaze/vision/head_pose.py` | 6-point PnP head pose estimation, pitch extraction, EMA smoothing |
+| `igaze/controls.py` | Combines all signals into desktop actions via PyAutoGUI; manages modes, cooldowns, debounce |
+| `igaze/vision/calibration.py` | Two-phase interactive calibration, local persistence, post-calibration validation |
+| `igaze/ui.py` | Tkinter control panel, live status polling, sensitivity slider interface |
 | `main.py` | Application controller, thread management, shared state dict, HUD rendering |
 
 ---
@@ -195,7 +195,7 @@ pip install mediapipe opencv-python numpy pyautogui
 ### 4. Verify Installation
 
 ```bash
-python eye_tracker.py
+python -m igaze.vision.eye_tracker
 ```
 
 A camera window should open showing the live feed with eye landmark overlays. Press `q` to close.
@@ -238,33 +238,35 @@ This launches the Tkinter control panel. From there:
 
 ```bash
 # Test webcam capture and EAR visualisation only
-python eye_tracker.py
+python -m igaze.vision.eye_tracker
 
 # Test gaze detection with live overlay
-python gaze_detector.py
+python -m igaze.vision.gaze_detector
 
 # Test all 4 gestures end-to-end (no GUI)
-python gesture_mapper.py
+python -m igaze.controls
 ```
 
 ---
 
 ## Project Structure
 
-```
+```text
+main.py                    # Launch the desktop app
 igaze/
-├── main.py               # Application entry point and controller
-├── eye_tracker.py        # Webcam capture, MediaPipe inference, EAR computation
-├── gaze_detector.py      # Iris-ratio gaze classification, blink detection
-├── head_pose.py          # PnP-based head pitch estimation with EMA smoothing
-├── gesture_mapper.py     # Gesture-to-action mapping, mode management
-├── calibration.py        # Two-phase calibration, JSON persistence, validation
-├── gui.py                # Tkinter dark-themed control panel
-├── face_landmarker.task  # MediaPipe FaceLandmarker model (binary, ~3.6 MB)
-├── igaze_cal.json        # Saved calibration parameters (auto-generated)
-├── .gitignore
-└── README.md
+  controller.py            # Camera, calibration and tracking lifecycle
+  ui.py                    # Tkinter control panel
+  controls.py              # Gesture timing and Windows actions
+  storage.py               # Local SQLite storage
+  paths.py                 # Model and user data locations
+  vision/                  # Camera, gaze, head pose and calibration
+face_landmarker.task       # MediaPipe model
+igaze_cal.json             # Legacy calibration import
+tests/                     # Persistence and gesture regression checks
 ```
+
+On Windows, iGAZE stores calibration, sensitivity settings and completed-session summaries in
+`%LOCALAPPDATA%\iGAZE\igaze.sqlite3`. See the [desktop workspace guide](docs/DESKTOP_WORKSPACE.md).
 
 ---
 
@@ -356,7 +358,7 @@ All parameters below can be adjusted at runtime through the GUI sliders or by pa
 | `triple_max_window_ms` | `900 ms` | 400–2000 ms | Rolling window within which 3 blinks must occur to register a triple-blink |
 | `disable_hold_sec` | `5.0 s` | 2.0–15.0 s | Eye-close duration that toggles eye control ON/OFF on re-open |
 
-Additional parameters set during calibration (stored in `igaze_cal.json`):
+Additional parameters set during calibration (stored in the local SQLite database):
 
 | Parameter | Description |
 |---|---|
@@ -370,7 +372,7 @@ Fixed internal parameters (require code change to modify):
 | Parameter | Value | Location | Description |
 |---|---|---|---|
 | `head_max_pitch` | `20.0°` | `GestureMapper.__init__` | Pitch angle yielding maximum scroll speed |
-| `max_scroll_px_per_sec` | `300.0` | `GestureMapper.__init__` | Peak scroll velocity in pixels/second |
+| `max_scroll_steps_per_sec` | `3.0` | `GestureMapper.__init__` | Maximum mouse wheel notches per second |
 | `action_cooldown` | `0.9 s` | `GestureMapper.__init__` | Minimum time between successive tab-switch / app-navigate actions |
 | `smooth_alpha` | `0.15` | `HeadPoseEstimator.__init__` | EMA factor for head pitch smoothing |
 | `_EYE_CLOSE_DEBOUNCE_FRAMES` | `8` | `GestureMapper` class | Consecutive below-EAR frames required before the disable timer starts |
@@ -407,7 +409,7 @@ docs/
 
 - **Single face only** — The `FaceLandmarkerOptions` is set to `num_faces=1`. The system will not function with multiple people in frame simultaneously.
 - **Lighting sensitivity** — Iris landmark quality degrades in low light or with strong backlighting. Calibration in the same lighting conditions as intended use is recommended.
-- **Windows-specific hotkeys** — The gesture-to-action mappings in `gesture_mapper.py` use `Win+Tab`, `Ctrl+Tab`, and `Ctrl+Shift+Tab`, which are Windows-specific shortcuts. Porting to macOS or Linux requires remapping these.
+- **Windows-specific hotkeys** — The gesture-to-action mappings in `igaze/controls.py` use `Win+Tab`, `Ctrl+Tab`, and `Ctrl+Shift+Tab`, which are Windows-specific shortcuts. Porting to macOS or Linux requires remapping these.
 - **No vertical gaze actions** — Gaze UP and DOWN are detected but explicitly silenced in `update_gaze()` (by design, to prevent the Midas Touch problem during reading). They cannot currently be bound to actions.
 - **Right-wink detected but not mapped** — The wink detection signal returned by `gaze_detector.update_blink()` is computed but not consumed by `GestureMapper` or any other component.
 - **Fixed camera index** — The webcam is opened at index `0`. Systems with multiple cameras will require a code change.
@@ -436,7 +438,7 @@ docs/
    ```bash
    git checkout -b feature/your-feature-name
    ```
-2. Make your changes and ensure existing behaviour is not broken (run `python gesture_mapper.py` and `python gaze_detector.py` as a quick smoke test).
+2. Make your changes and ensure existing behaviour is not broken (run `python -m igaze.controls` and `python -m igaze.vision.gaze_detector` as a quick smoke test).
 3. Keep changes focused; one feature or fix per pull request.
 4. Describe the motivation and approach clearly in the pull request description.
 5. Submit the pull request against the `main` branch.
